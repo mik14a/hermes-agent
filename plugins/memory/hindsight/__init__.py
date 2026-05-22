@@ -519,7 +519,7 @@ def _load_simple_env(path) -> dict[str, str]:
 
 
 def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None) -> dict[str, str]:
-    """Build the profile-scoped env file that standalone hindsight-embed consumes."""
+    """Keys Hermes owns via hindsight/config.json (written into profile .env on materialize)."""
     current_key = llm_api_key
     if current_key is None:
         current_key = (
@@ -601,11 +601,44 @@ def _validate_profile_env_permissions(profile_env) -> None:
 
 
 def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None):
-    """Write the profile-scoped env file that standalone hindsight-embed uses."""
+    """Patch profile .env: update config-managed keys in place; preserve comments and other keys."""
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
-    env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
-    content = "".join(f"{key}={value}\n" for key, value in env_values.items())
+    managed = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
+    managed_keys = set(managed)
+
+    if not profile_env.exists():
+        content = "\n".join(f"{key}={value}" for key, value in managed.items()) + "\n"
+    else:
+        lines_out: list[str] = []
+        seen_managed: set[str] = set()
+        for line in profile_env.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                lines_out.append(line)
+                continue
+
+            assignment = stripped
+            if assignment.startswith("export "):
+                assignment = assignment[7:].strip()
+            if "=" not in assignment:
+                lines_out.append(line)
+                continue
+
+            key, _ = assignment.split("=", 1)
+            key = key.strip()
+            if key in managed_keys:
+                lines_out.append(f"{key}={managed[key]}")
+                seen_managed.add(key)
+            else:
+                lines_out.append(line)
+
+        for key, value in managed.items():
+            if key not in seen_managed:
+                lines_out.append(f"{key}={value}")
+
+        content = "\n".join(lines_out) + "\n"
+
     try:
         _secure_write_profile_env(profile_env, content)
         _validate_profile_env_permissions(profile_env)
@@ -1665,13 +1698,13 @@ class HindsightMemoryProvider(MemoryProvider):
                     client = self._get_client()
                     profile = self._config.get("profile", "hermes")
 
-                    # Update the profile .env to match our current config so
-                    # the daemon always starts with the right settings.
-                    # If the config changed and the daemon is running, stop it.
+                    # Materialize only patches config.json keys into hermes.env; other env
+                    # lines stay. Restart the daemon when those managed keys changed.
                     profile_env = _embedded_profile_env_path(self._config)
-                    expected_env = _build_embedded_profile_env(self._config)
-                    saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
+                    on_disk = _load_simple_env(profile_env)
+                    managed = _build_embedded_profile_env(self._config)
+                    patched = {**on_disk, **managed}
+                    config_changed = on_disk != patched
 
                     if config_changed:
                         profile_env = _materialize_embedded_profile_env(self._config)

@@ -27,6 +27,8 @@ from plugins.memory.hindsight import (
     _load_simple_env,
     _build_embedded_profile_env,
     _normalize_observation_scopes,
+    _materialize_embedded_profile_env,
+    _load_simple_env,
     _normalize_retain_tags,
     _resolve_bank_id_template,
     _sanitize_bank_segment,
@@ -354,6 +356,64 @@ class TestConfig:
 
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
+
+
+class TestMaterializePreservesUnmanagedEnvKeys:
+    def test_materialize_keeps_env_keys_not_in_config_json(self, tmp_path, monkeypatch):
+        user_home = tmp_path / "user-home"
+        user_home.mkdir()
+        monkeypatch.setenv("HOME", str(user_home))
+
+        profiles_dir = user_home / ".hindsight" / "profiles"
+        profiles_dir.mkdir(parents=True)
+        profile_env = profiles_dir / "hermes.env"
+        profile_env.write_text(
+            "HINDSIGHT_API_RERANKER_LOCAL_MODEL=hotchpotch/japanese-reranker-xsmall-v2\n"
+            "HINDSIGHT_API_LLM_MODEL=old-model\n",
+            encoding="utf-8",
+        )
+
+        config = {
+            "profile": "hermes",
+            "llm_provider": "lmstudio",
+            "llm_model": "mik14a/gemma-4-26b-a4b-it",
+            "llm_api_key": "sk-test",
+        }
+        _materialize_embedded_profile_env(config, llm_api_key="sk-test")
+
+        merged = _load_simple_env(profile_env)
+        assert merged["HINDSIGHT_API_RERANKER_LOCAL_MODEL"] == "hotchpotch/japanese-reranker-xsmall-v2"
+        assert merged["HINDSIGHT_API_LLM_MODEL"] == "mik14a/gemma-4-26b-a4b-it"
+        assert merged["HINDSIGHT_API_LLM_PROVIDER"] == "lmstudio"
+
+    def test_materialize_preserves_comments_and_group_headers(self, tmp_path, monkeypatch):
+        user_home = tmp_path / "user-home"
+        user_home.mkdir()
+        monkeypatch.setenv("HOME", str(user_home))
+
+        profile_env = user_home / ".hindsight" / "profiles" / "hermes.env"
+        profile_env.parent.mkdir(parents=True)
+        profile_env.write_text(
+            "# --- Daemon ---\n"
+            "HINDSIGHT_API_LLM_MODEL=old-model\n"
+            "# --- Reranker ---\n"
+            "HINDSIGHT_API_RERANKER_LOCAL_MODEL=hotchpotch/japanese-reranker-xsmall-v2\n",
+            encoding="utf-8",
+        )
+
+        config = {
+            "profile": "hermes",
+            "llm_provider": "lmstudio",
+            "llm_model": "mik14a/gemma-4-26b-a4b-it",
+            "llm_api_key": "sk-test",
+        }
+        _materialize_embedded_profile_env(config, llm_api_key="sk-test")
+
+        text = profile_env.read_text(encoding="utf-8")
+        assert "# --- Daemon ---" in text
+        assert "# --- Reranker ---" in text
+        assert "HINDSIGHT_API_LLM_MODEL=mik14a/gemma-4-26b-a4b-it" in text
+        assert "HINDSIGHT_API_RERANKER_LOCAL_MODEL=hotchpotch/japanese-reranker-xsmall-v2" in text
 
 
 class TestPostSetup:
