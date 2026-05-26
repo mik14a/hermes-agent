@@ -902,9 +902,13 @@ def ensure_hermes_home():
     else:
         home.mkdir(parents=True, exist_ok=True)
         _secure_dir(home)
+        # Consolidated cache layout (#3610). Do not mkdir legacy image_cache/ etc. —
+        # empty legacy dirs make get_hermes_dir() prefer the old path forever.
         for subdir in (
             "cron", "sessions", "logs", "logs/curator", "memories",
-            "pairing", "hooks", "image_cache", "audio_cache", "skills",
+            "pairing", "hooks", "skills",
+            "cache/images", "cache/audio", "cache/videos",
+            "cache/documents", "cache/screenshots",
         ):
             d = home / subdir
             d.mkdir(parents=True, exist_ok=True)
