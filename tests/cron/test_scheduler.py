@@ -419,6 +419,58 @@ class TestDeliverResultWrapping:
         assert voice_call[1]["audio_path"] == str(media_path)
 
 
+    def test_live_adapter_routes_image_to_send_image_file(self, tmp_path, monkeypatch):
+        """Image MEDIA files should be routed to send_image_file, not send_voice."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "chart.png")
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        adapter.send_image_file.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            # Actually run the routed coroutine (router._deliver_to_platform)
+            # so the underlying adapter.send is invoked, then wrap the real
+            # result in a completed Future (matching run_coroutine_threadsafe).
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
+
+        job = {
+            "id": "img-job",
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "1234"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            _deliver_result(
+                job,
+                f"Chart attached\nMEDIA:{media_path}",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+            )
+
+        adapter.send.assert_not_called()
+        adapter.send_image_file.assert_called_once()
+        assert adapter.send_image_file.call_args[1]["image_path"] == str(media_path)
+        assert adapter.send_image_file.call_args[1]["caption"] == "Chart attached"
+        adapter.send_voice.assert_not_called()
+
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
 

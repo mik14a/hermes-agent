@@ -4339,6 +4339,119 @@ class BasePlatformAdapter(ABC):
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
+    # Extensions treated as still images for caption bundling (not voice/video).
+    _DELIVERY_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
+
+    # Platforms where response text can ride on a native image caption/content field.
+    _MEDIA_CAPTION_PLATFORMS = frozenset({
+        "telegram",
+        "discord",
+        "slack",
+        "matrix",
+        "signal",
+        "feishu",
+        "weixin",
+        "yuanbao",
+        "whatsapp",
+        "wecom",
+        "dingtalk",
+        "mattermost",
+        "bluebubbles",
+        "qqbot",
+    })
+
+    _MEDIA_CAPTION_MAX_LEN: Dict[str, int] = {
+        "telegram": 1024,
+        "discord": 2000,
+        "slack": 2000,
+        "matrix": 4000,
+        "signal": 2000,
+        "feishu": 2000,
+        "weixin": 2000,
+        "yuanbao": 2000,
+        "whatsapp": 1024,
+        "wecom": 2000,
+        "dingtalk": 2000,
+        "mattermost": 4000,
+        "bluebubbles": 2000,
+        "qqbot": 2000,
+    }
+    _DEFAULT_MEDIA_CAPTION_MAX_LEN = 2000
+
+    @staticmethod
+    def partition_text_and_image_caption(
+        text: str,
+        media_files: List[Tuple[str, bool]],
+        *,
+        platform: Optional[str] = None,
+    ) -> Tuple[str, List[Tuple[str, bool]], Optional[str]]:
+        """Return (remaining_text, media_files, caption) for single-image caption bundling.
+
+        When a lone still image can carry the full response text as a native
+        platform caption, ``remaining_text`` is empty and ``caption`` holds the
+        text. Otherwise the inputs are returned unchanged with ``caption=None``.
+        """
+        cleaned = (text or "").strip()
+        if not cleaned or not media_files or len(media_files) != 1:
+            return text, media_files, None
+
+        platform_key = (platform or "").strip().lower()
+        if platform_key and platform_key not in BasePlatformAdapter._MEDIA_CAPTION_PLATFORMS:
+            return text, media_files, None
+
+        media_path, is_voice = media_files[0]
+        ext = Path(media_path).suffix.lower()
+        if is_voice or ext not in BasePlatformAdapter._DELIVERY_IMAGE_EXTS:
+            return text, media_files, None
+
+        max_len = BasePlatformAdapter._MEDIA_CAPTION_MAX_LEN.get(
+            platform_key,
+            BasePlatformAdapter._DEFAULT_MEDIA_CAPTION_MAX_LEN,
+        )
+        if len(cleaned) > max_len:
+            return text, media_files, None
+
+        return "", media_files, cleaned
+
+    @staticmethod
+    def caption_for_image_batch(
+        text: str,
+        image_paths: List[str],
+        *,
+        platform: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """Attach response text to the first image when the platform supports it.
+
+        For a single image, delegates to ``partition_text_and_image_caption``.
+        For multiple images, returns the full text as the first-image caption when
+        it fits the platform limit (Discord/Telegram multi-attach message body).
+        """
+        cleaned = (text or "").strip()
+        if not cleaned or not image_paths:
+            return text, None
+
+        platform_key = (platform or "").strip().lower()
+        if platform_key and platform_key not in BasePlatformAdapter._MEDIA_CAPTION_PLATFORMS:
+            return text, None
+
+        if len(image_paths) == 1:
+            remaining, _, caption = BasePlatformAdapter.partition_text_and_image_caption(
+                cleaned,
+                [(image_paths[0], False)],
+                platform=platform,
+            )
+            if caption:
+                return remaining, caption
+            return text, None
+
+        max_len = BasePlatformAdapter._MEDIA_CAPTION_MAX_LEN.get(
+            platform_key,
+            BasePlatformAdapter._DEFAULT_MEDIA_CAPTION_MAX_LEN,
+        )
+        if len(cleaned) <= max_len:
+            return "", cleaned
+        return text, None
+
     @staticmethod
     def validate_media_delivery_path(path: str) -> Optional[str]:
         """Return a resolved path if it is safe for native attachment upload."""
@@ -6042,6 +6155,46 @@ class BasePlatformAdapter(ABC):
                         except OSError:
                             pass
 
+                # Partition local images out of media_files for caption bundling / batching.
+                # When ``[[as_document]]`` was set on the original response, image
+                # files skip the photo path and route to send_document below so
+                # they're delivered with original bytes (no Telegram sendPhoto
+                # recompression).
+                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+                from urllib.parse import quote as _quote
+                _image_paths: list = []
+                _non_image_media: list = []
+                for media_path, is_voice in media_files:
+                    _ext = Path(media_path).suffix.lower()
+                    if (_ext in _IMAGE_EXTS
+                            and not is_voice
+                            and not force_document_attachments):
+                        _image_paths.append(media_path)
+                    else:
+                        _non_image_media.append((media_path, is_voice))
+                _non_image_local: list = []
+                for file_path in local_files:
+                    if (Path(file_path).suffix.lower() in _IMAGE_EXTS
+                            and not force_document_attachments):
+                        _image_paths.append(file_path)
+                    else:
+                        _non_image_local.append(file_path)
+
+                _platform_name = getattr(self, "name", None) or getattr(self, "platform", None)
+                _first_image_caption: Optional[str] = None
+                if (
+                    text_content.strip()
+                    and _image_paths
+                    and not images
+                    and not force_document_attachments
+                ):
+                    text_content, _first_image_caption = BasePlatformAdapter.caption_for_image_batch(
+                        text_content,
+                        _image_paths,
+                        platform=_platform_name,
+                    )
+
                 # Send the text portion. A reconnect may have replaced this
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
@@ -6155,44 +6308,27 @@ class BasePlatformAdapter(ABC):
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
-                # Send extracted media files — route by file type
-                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
-
-                # Partition images out of media_files + local_files so they
-                # can be sent as a single batch (Signal RPC). When
-                # ``[[as_document]]`` was set on the original response, image
-                # files skip the photo path and route to send_document below
-                # so they're delivered with original bytes (no Telegram
-                # sendPhoto recompression).
-                from urllib.parse import quote as _quote
-                _image_paths: list = []
-                _non_image_media: list = []
-                for media_path, is_voice in media_files:
-                    _ext = Path(media_path).suffix.lower()
-                    if (_ext in _IMAGE_EXTS
-                            and not is_voice
-                            and not force_document_attachments):
-                        _image_paths.append(media_path)
-                    else:
-                        _non_image_media.append((media_path, is_voice))
-                _non_image_local: list = []
-                for file_path in local_files:
-                    if (Path(file_path).suffix.lower() in _IMAGE_EXTS
-                            and not force_document_attachments):
-                        _image_paths.append(file_path)
-                    else:
-                        _non_image_local.append(file_path)
-
                 if _image_paths:
                     try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
-                            chat_id=event.source.chat_id,
-                            images=_batch,
-                            metadata=_final_thread_metadata,
-                            human_delay=human_delay,
-                        )
+                        if len(_image_paths) == 1 and _first_image_caption:
+                            img_result = await self.send_image_file(
+                                chat_id=event.source.chat_id,
+                                image_path=_image_paths[0],
+                                caption=_first_image_caption,
+                                metadata=_final_thread_metadata,
+                            )
+                            _record_delivery(img_result)
+                        else:
+                            _batch = []
+                            for idx, path in enumerate(_image_paths):
+                                alt = _first_image_caption if idx == 0 and _first_image_caption else ""
+                                _batch.append((f"file://{_quote(path)}", alt))
+                            await self.send_multiple_images(
+                                chat_id=event.source.chat_id,
+                                images=_batch,
+                                metadata=_final_thread_metadata,
+                                human_delay=human_delay,
+                            )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 

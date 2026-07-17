@@ -1477,6 +1477,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
+    image_caption: str | None = None,
 ) -> None:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
@@ -1490,16 +1491,22 @@ def _send_media_via_adapter(
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
-    for media_path, _is_voice in media_files:
+    for idx, (media_path, _is_voice) in enumerate(media_files):
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
+            caption = image_caption if idx == 0 and image_caption else None
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
                 coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
             elif ext in _VIDEO_EXTS:
                 coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                coro = adapter.send_image_file(
+                    chat_id=chat_id,
+                    image_path=media_path,
+                    caption=caption,
+                    metadata=metadata,
+                )
             else:
                 coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
 
@@ -1928,14 +1935,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
             try:
-                # Send cleaned text (MEDIA tags stripped) — not the raw content.
-                # Route through the gateway's DeliveryRouter so the live send
-                # gets the same platform-specific routing as live messages —
-                # in particular Telegram's three-mode topic routing.  The
-                # standalone cron path lacked this, so DM-topic cron deliveries
-                # landed in the General topic or were rejected by Bot API 10.0
-                # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                # Bundle lone image + text as a single captioned attachment when
+                # supported.  text_to_send is then routed through the gateway's
+                # DeliveryRouter below so the live send gets the same
+                # platform-specific routing as live messages — in particular
+                # Telegram's three-mode topic routing (#22773).
+                text_to_send, media_files, image_caption = BasePlatformAdapter.partition_text_and_image_caption(
+                    cleaned_delivery_content,
+                    media_files,
+                    platform=platform_name,
+                )
+                text_to_send = text_to_send.strip()
+                if image_caption:
+                    logger.info(
+                        "Job '%s': bundling %d chars of text as image caption for %s:%s",
+                        job["id"], len(image_caption), platform_name, chat_id,
+                    )
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -2102,6 +2117,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                         job,
                         platform=platform,
+                        image_caption=image_caption,
                     )
                 elif timed_out and media_files:
                     msg = (
