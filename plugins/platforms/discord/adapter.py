@@ -1486,7 +1486,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if other_bots_mentioned and not raw_self_mention:
                 return False, False
             ignore_no_mention = _scoped_gate_env("DISCORD_IGNORE_NO_MENTION", "true").lower() in {"true", "1", "yes"}
-            if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
+            everyone_mentioned = bool(getattr(message, "mention_everyone", False))
+            if ignore_no_mention and not raw_self_mention and not other_bots_mentioned and not everyone_mentioned:
                 # A thread the bot joined is not someone else's conversation, and the other two
                 # ingress paths already exempt it: _dispatch_recovered_message() and
                 # _handle_message(). Admission runs on both and can veto what they admit, so
@@ -2328,7 +2329,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 and "*" not in free_channels
                 and not (channel_keys & free_channels)
                 and not self._in_bot_thread(message)
-                and not self._self_is_explicitly_mentioned(message)
+                and not self._discord_message_satisfies_mention_requirement(message)
             ):
                 return False
         admitted, role_authorized = self._discord_message_admission(message, claim=False)
@@ -4785,6 +4786,24 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             "free_response_auto_thread", "DISCORD_FREE_RESPONSE_AUTO_THREAD", "false", truthy=True,
         )
 
+    def _discord_message_satisfies_mention_requirement(
+        self,
+        message,
+        *,
+        mention_prefix: bool = False,
+    ) -> bool:
+        """Return True if *message* satisfies ``require_mention`` gating.
+
+        Counts direct bot user mentions and server-wide ``@everyone`` /
+        ``@here`` pings (``message.mention_everyone``). Role mentions are
+        intentionally excluded — they do not populate ``message.mentions``.
+        """
+        if mention_prefix:
+            return True
+        if self._self_is_explicitly_mentioned(message):
+            return True
+        return bool(getattr(message, "mention_everyone", False))
+
     def _discord_max_attachment_bytes(self) -> int:
         """Per-attachment byte cap; 0 = unlimited (whole attachment is held in memory). Default 32 MiB."""
         configured = self.config.extra.get("max_attachment_bytes")
@@ -5985,8 +6004,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             in_bot_thread = self._in_bot_thread(message)
             if require_mention and not is_free_channel and not in_bot_thread:
                 if (
-                    not self._self_is_explicitly_mentioned(message)
-                    and not mention_prefix
+                    not self._discord_message_satisfies_mention_requirement(
+                        message, mention_prefix=mention_prefix,
+                    )
                     and not self._is_bot_tag_debounce_continuation(message)
                 ):
                     return False
