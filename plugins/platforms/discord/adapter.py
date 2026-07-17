@@ -1492,7 +1492,13 @@ class DiscordAdapter(BasePlatformAdapter):
             ignore_no_mention = os.getenv(
                 "DISCORD_IGNORE_NO_MENTION", "true"
             ).lower() in {"true", "1", "yes"}
-            if ignore_no_mention and not raw_self_mention and not other_bots_mentioned:
+            everyone_mentioned = bool(getattr(message, "mention_everyone", False))
+            if (
+                ignore_no_mention
+                and not raw_self_mention
+                and not other_bots_mentioned
+                and not everyone_mentioned
+            ):
                 parent_id = None
                 if hasattr(message.channel, "parent_id") and message.channel.parent_id:
                     parent_id = str(message.channel.parent_id)
@@ -6150,6 +6156,24 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
+    def _discord_message_satisfies_mention_requirement(
+        self,
+        message,
+        *,
+        mention_prefix: bool = False,
+    ) -> bool:
+        """Return True if *message* satisfies ``require_mention`` gating.
+
+        Counts direct bot user mentions and server-wide ``@everyone`` /
+        ``@here`` pings (``message.mention_everyone``). Role mentions are
+        intentionally excluded — they do not populate ``message.mentions``.
+        """
+        if mention_prefix:
+            return True
+        if self._self_is_explicitly_mentioned(message):
+            return True
+        return bool(getattr(message, "mention_everyone", False))
+
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -7753,7 +7777,9 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
+                if not self._discord_message_satisfies_mention_requirement(
+                    message, mention_prefix=mention_prefix,
+                ):
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
