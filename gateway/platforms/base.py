@@ -3167,6 +3167,77 @@ class BasePlatformAdapter(ABC):
         return await self._send_media_fallback_notice(
             "send_image_file", "image", image_path, chat_id, caption, reply_to, metadata)
 
+    # Platforms where response text can ride on a native image caption/content field.
+    _MEDIA_CAPTION_PLATFORMS = frozenset({
+        "telegram", "discord", "slack", "matrix", "signal", "feishu", "weixin",
+        "yuanbao", "whatsapp", "wecom", "dingtalk", "mattermost", "bluebubbles", "qqbot",
+    })
+    _MEDIA_CAPTION_MAX_LEN: Dict[str, int] = {
+        "telegram": 1024, "discord": 2000, "slack": 2000, "matrix": 4000, "signal": 2000,
+        "feishu": 2000, "weixin": 2000, "yuanbao": 2000, "whatsapp": 1024, "wecom": 2000,
+        "dingtalk": 2000, "mattermost": 4000, "bluebubbles": 2000, "qqbot": 2000,
+    }
+    _DEFAULT_MEDIA_CAPTION_MAX_LEN = 2000
+
+    @staticmethod
+    def partition_text_and_image_caption(
+        text: str,
+        media_files: List[Tuple[str, bool]],
+        *,
+        platform: Optional[str] = None,
+    ) -> Tuple[str, List[Tuple[str, bool]], Optional[str]]:
+        """Return (remaining_text, media_files, caption) for single-image caption bundling.
+
+        When a lone still image can carry the full response text as a native
+        platform caption, ``remaining_text`` is empty and ``caption`` holds the
+        text. Otherwise the inputs are returned unchanged with ``caption=None``.
+        """
+        cleaned = (text or "").strip()
+        if not cleaned or not media_files or len(media_files) != 1:
+            return text, media_files, None
+
+        platform_key = (platform or "").strip().lower()
+        if platform_key and platform_key not in BasePlatformAdapter._MEDIA_CAPTION_PLATFORMS:
+            return text, media_files, None
+
+        media_path, is_voice = media_files[0]
+        ext = Path(media_path).suffix.lower()
+        if is_voice or ext not in _IMAGE_EXTS:
+            return text, media_files, None
+
+        max_len = BasePlatformAdapter._MEDIA_CAPTION_MAX_LEN.get(
+            platform_key, BasePlatformAdapter._DEFAULT_MEDIA_CAPTION_MAX_LEN)
+        if len(cleaned) > max_len:
+            return text, media_files, None
+        return "", media_files, cleaned
+
+    @staticmethod
+    def caption_for_image_batch(
+        text: str,
+        image_paths: List[str],
+        *,
+        platform: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """Attach response text to the first image when the platform supports it."""
+        cleaned = (text or "").strip()
+        if not cleaned or not image_paths:
+            return text, None
+
+        platform_key = (platform or "").strip().lower()
+        if platform_key and platform_key not in BasePlatformAdapter._MEDIA_CAPTION_PLATFORMS:
+            return text, None
+
+        if len(image_paths) == 1:
+            remaining, _, caption = BasePlatformAdapter.partition_text_and_image_caption(
+                cleaned, [(image_paths[0], False)], platform=platform)
+            return (remaining, caption) if caption else (text, None)
+
+        max_len = BasePlatformAdapter._MEDIA_CAPTION_MAX_LEN.get(
+            platform_key, BasePlatformAdapter._DEFAULT_MEDIA_CAPTION_MAX_LEN)
+        if len(cleaned) <= max_len:
+            return "", cleaned
+        return text, None
+
     @staticmethod
     def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
         """Return a resolved path if it is safe for native attachment upload."""
@@ -4186,7 +4257,7 @@ class BasePlatformAdapter(ABC):
     async def _deliver_media_attachments(
         self, event: MessageEvent, media_files: list, local_files: list, *,
         force_document_attachments: bool, human_delay: float, metadata: Dict[str, Any],
-        record_delivery: Callable) -> None:
+        record_delivery: Callable, image_caption: Optional[str] = None) -> None:
         """Deliver MEDIA-tag files and detected local files by type: images batched via
         ``send_multiple_images`` unless ``[[as_document]]``; otherwise audio → send_voice (MEDIA
         tags only, never bare local files), video → send_video, else send_document. Every failure is
@@ -4199,8 +4270,10 @@ class BasePlatformAdapter(ABC):
         _image_paths += [p for p in local_files if _as_image(p)]
         if _image_paths:
             await self._send_image_batch(
-                event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
-                record_delivery)
+                event,
+                [(f"file://{_quote(p)}", (image_caption if i == 0 else "") or "")
+                 for i, p in enumerate(_image_paths)],
+                metadata, human_delay, record_delivery)
         chat_id = event.source.chat_id
 
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
@@ -4318,7 +4391,7 @@ class BasePlatformAdapter(ABC):
 
     async def _deliver_attachments(self, event: MessageEvent, extracted: "_ExtractedResponse",
                                    metadata: Dict[str, Any], *, anything_sent: bool,
-                                   record_delivery: Callable) -> None:
+                                   record_delivery: Callable, image_caption: Optional[str] = None) -> None:
         """Send extracted image URLs, MEDIA files and bare local files (human-paced),
         then fail loudly if a non-empty response produced nothing deliverable. Attachment
         results feed ``record_delivery`` so the turn outcome reflects them."""
@@ -4330,7 +4403,8 @@ class BasePlatformAdapter(ABC):
         await self._deliver_media_attachments(
             event, media_files, local_files,
             force_document_attachments=extracted.force_document_attachments,
-            human_delay=human_delay, metadata=metadata, record_delivery=record_delivery)
+            human_delay=human_delay, metadata=metadata, record_delivery=record_delivery,
+            image_caption=image_caption)
         if not (anything_sent or images or local_files or media_files) and extracted.pre_extract.strip():
             logger.error("[%s] response_delivery_dropped: non-empty response "
                          "(%d chars) produced no delivered message or attachment "
@@ -4491,6 +4565,20 @@ class BasePlatformAdapter(ABC):
                 if not _tts_paths and _tts_requested_path is not None:
                     with contextlib.suppress(OSError):
                         os.remove(_tts_requested_path)
+                _image_caption = None
+                if (
+                    not extracted.force_document_attachments
+                    and not _tts_caption_delivered
+                    and not _tts_paths
+                ):
+                    platform_key = getattr(self.platform, "value", None) or str(self.platform or "")
+                    image_paths = [
+                        p for p, is_voice in media_files
+                        if not is_voice and Path(p).suffix.lower() in _IMAGE_EXTS
+                    ]
+                    text_content, _image_caption = BasePlatformAdapter.caption_for_image_batch(
+                        text_content, image_paths, platform=platform_key)
+                    extracted.text_content = text_content
                 # Suspend the typing refresh before the first delivery attempt, not just in
                 # the turn's finally (#117300): if the final send stalls (platform accepted it
                 # but the HTTP ack never returns), control never reaches the finally, and
@@ -4501,7 +4589,7 @@ class BasePlatformAdapter(ABC):
                 # turn. No new await on the delivery path (a fire-and-forget stop task was
                 # measured to have no effect).
                 if text_content or extracted.images or extracted.media_files or extracted.local_files \
-                        or _tts_paths or _tts_caption_delivered:
+                        or _tts_paths or _tts_caption_delivered or _image_caption:
                     self.pause_typing_for_chat(event.source.chat_id)
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
@@ -4510,7 +4598,7 @@ class BasePlatformAdapter(ABC):
                 await self._deliver_attachments(
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
-                    record_delivery=_record_delivery)
+                    record_delivery=_record_delivery, image_caption=_image_caption)
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.

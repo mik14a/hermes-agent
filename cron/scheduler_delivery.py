@@ -1116,6 +1116,7 @@ _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
 
 def _send_media_via_adapter(
     adapter, chat_id: str, media_files: list, metadata: dict | None, loop, job: dict, platform=None,
+    image_caption: str | None = None,
 ) -> list:
     """Send MEDIA files as native attachments (routed by extension, as in
     _process_message_background). Returns per-file error strings so a dropped attachment surfaces
@@ -1138,19 +1139,24 @@ def _send_media_via_adapter(
             errors.append(f"attachment dropped by media path policy: {raw_path}")
 
     route_platform = platform if platform is not None else getattr(adapter, "platform", None)
-    for media_path, _is_voice in media_files:
+    for idx, (media_path, _is_voice) in enumerate(media_files):
         try:
             ext = _sched.Path(media_path).suffix.lower()
+            caption = image_caption if idx == 0 and image_caption else None
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
                 method, path_kw = "send_voice", "audio_path"
+                extra = {}
             elif ext in _VIDEO_EXTS:
                 method, path_kw = "send_video", "video_path"
+                extra = {}
             elif ext in _IMAGE_EXTS:
                 method, path_kw = "send_image_file", "image_path"
+                extra = {"caption": caption} if caption else {}
             else:
                 method, path_kw = "send_document", "file_path"
+                extra = {}
             coro = getattr(adapter, method)(
-                chat_id=chat_id, metadata=metadata, **{path_kw: media_path})
+                chat_id=chat_id, metadata=metadata, **{path_kw: media_path}, **extra)
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
                 _note_target_error(
@@ -1539,7 +1545,9 @@ def _live_send_text(
 
 
 def _live_send_media(
-    t: _TargetDelivery, media_metadata: dict, media_files: list, delivery_errors: list) -> None:
+    t: _TargetDelivery, media_metadata: dict, media_files: list, delivery_errors: list,
+    image_caption: str | None = None,
+) -> None:
     """Send extracted media as native attachments with the same routing as the text send."""
     routed_media_metadata = dict(media_metadata or {})
     if t.is_relay:
@@ -1552,7 +1560,7 @@ def _live_send_media(
                 routed_media_metadata["scope_id"] = logical_home.scope_id
     _media_errors = _send_media_via_adapter(
         t.runtime_adapter, t.chat_id, media_files, routed_media_metadata or None, t.loop, t.job,
-        platform=t.platform,
+        platform=t.platform, image_caption=image_caption,
     )
     # Surface per-file failures into run status: text delivered but attachment lost is not ok.
     for _me in _media_errors:
@@ -1619,9 +1627,10 @@ def _deliver_via_live_adapter(
     route_thread_id, route_metadata, media_metadata = _live_route_metadata(t)
     delivered = False
     try:
-        # Send cleaned text (MEDIA tags stripped) through the gateway's DeliveryRouter so it gets
-        # the same platform routing as live messages (Telegram's three-mode topic routing).
-        text_to_send = cleaned_text.strip()
+        from gateway.platforms.base import BasePlatformAdapter
+        text_to_send, media_files, image_caption = BasePlatformAdapter.partition_text_and_image_caption(
+            cleaned_text, media_files, platform=t.platform_name)
+        text_to_send = text_to_send.strip()
         adapter_ok, timed_out, delivered_message_id = True, False, None
         if not text_to_send and not media_files:
             # Fail closed so the run reports the empty payload.
@@ -1645,7 +1654,7 @@ def _deliver_via_live_adapter(
         # payload is already assumed delivered (#38922). Record the skipped attachments so the drop is
         # visible rather than silently lost.
         if adapter_ok and not timed_out and media_files:
-            _live_send_media(t, media_metadata, media_files, delivery_errors)
+            _live_send_media(t, media_metadata, media_files, delivery_errors, image_caption=image_caption)
         elif timed_out and media_files:
             _note_target_error(
                 job,
