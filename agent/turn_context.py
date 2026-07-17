@@ -336,6 +336,8 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    ext_system_prepend: str = ""
+    ext_system_append: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
 
@@ -1158,7 +1160,7 @@ def build_turn_context(
         agent._interrupt_message = None
         agent._interrupt_thread_signal_pending = False
 
-    # Notify memory providers of the new turn (BEFORE prefetch_all).
+    # Notify memory providers of the new turn (BEFORE prefetch_bundle).
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
@@ -1171,11 +1173,16 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
+    ext_system_prepend = ""
+    ext_system_append = ""
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                _prefetch_bundle = agent._memory_manager.prefetch_bundle(_query) or {}
+                ext_prefetch_cache = _prefetch_bundle.get("user", "") or ""
+                ext_system_prepend = _prefetch_bundle.get("system_prepend", "") or ""
+                ext_system_append = _prefetch_bundle.get("system_append", "") or ""
         except Exception:
             pass
 
@@ -1277,5 +1284,7 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        ext_system_prepend=ext_system_prepend,
+        ext_system_append=ext_system_append,
         preflight_compression_blocked=_preflight_compression_blocked,
     )

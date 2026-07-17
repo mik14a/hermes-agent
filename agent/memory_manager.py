@@ -31,7 +31,7 @@ import re
 import inspect
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
@@ -523,39 +523,77 @@ class MemoryManager:
         return extract_user_instruction_from_skill_message(text)
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
-        """Collect prefetch context from all providers.
+        """Collect prefetch context from all providers (user-message target).
 
         Returns merged context text labeled by provider. Empty providers
         are skipped. Failures in one provider don't block others.
         """
+        return self.prefetch_bundle(query, session_id=session_id).get("user", "")
+
+    def prefetch_bundle(self, query: str, *, session_id: str = "") -> Dict[str, str]:
+        """Collect prefetch context grouped by injection target.
+
+        Each provider's result is routed by its declared injection
+        position ("user", "prepend", "append"). Empty providers are
+        skipped and a failure in one provider doesn't block others.
+        """
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
-            return ""
-        parts = []
+            return {"user": "", "system_prepend": "", "system_append": ""}
+        user_parts: List[str] = []
+        prepend_parts: List[str] = []
+        append_parts: List[str] = []
         for provider in self._providers:
             try:
-                result = self._prefetch_provider(provider, clean_query, session_id=session_id)
-                if result and result.strip():
-                    parts.append(result)
+                position, result = self._prefetch_provider(
+                    provider, clean_query, session_id=session_id
+                )
+                if not result or not result.strip():
+                    continue
+                if position == "prepend":
+                    prepend_parts.append(result)
+                elif position == "append":
+                    append_parts.append(result)
+                else:
+                    user_parts.append(result)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
-        return "\n\n".join(parts)
+        return {
+            "user": "\n\n".join(user_parts),
+            "system_prepend": "\n\n".join(prepend_parts),
+            "system_append": "\n\n".join(append_parts),
+        }
 
     def _prefetch_provider(
         self, provider: MemoryProvider, query: str, *, session_id: str = ""
-    ) -> str:
-        if provider.name == "builtin":
-            return provider.prefetch(query, session_id=session_id)
+    ) -> Tuple[str, str]:
+        """Run a provider's prefetch, returning (injection_position, text).
 
-        result_box: Dict[str, str] = {}
+        Providers exposing ``consume_prefetch`` return the position they
+        want; otherwise ``prefetch_injection_position`` (if present) is
+        consulted, defaulting to "user". External providers run on a
+        bounded thread so a wedged provider can't stall the turn.
+        """
+        def _call() -> Tuple[str, str]:
+            if hasattr(provider, "consume_prefetch"):
+                return provider.consume_prefetch(query, session_id=session_id)
+            position = "user"
+            if hasattr(provider, "prefetch_injection_position"):
+                position = provider.prefetch_injection_position()
+            return position, (provider.prefetch(query, session_id=session_id) or "")
+
+        if provider.name == "builtin":
+            return _call()
+
+        result_box: Dict[str, Tuple[str, str]] = {}
         error_box: Dict[str, Exception] = {}
 
         def _run() -> None:
             try:
-                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+                result_box["value"] = _call()
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc
 
@@ -572,7 +610,7 @@ class MemoryManager:
                         "Memory provider '%s' prefetch is still running; skipping this turn",
                         provider.name,
                     )
-                    return ""
+                    return "user", ""
                 self._external_prefetch_threads.pop(provider.name, None)
             self._external_prefetch_threads[provider.name] = thread
             thread.start()
@@ -585,14 +623,14 @@ class MemoryManager:
                 provider.name,
                 self._external_prefetch_timeout,
             )
-            return ""
+            return "user", ""
 
         with self._external_prefetch_lock:
             if self._external_prefetch_threads.get(provider.name) is thread:
                 self._external_prefetch_threads.pop(provider.name, None)
         if error_box:
             raise error_box["value"]
-        return result_box.get("value", "")
+        return result_box.get("value", ("user", ""))
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.

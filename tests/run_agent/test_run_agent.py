@@ -6194,3 +6194,31 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
+
+
+class TestMemoryProviderTurnStart:
+    """run_conversation() must call memory_manager.on_turn_start() before prefetch.
+
+    Without this call, providers like Honcho never update _turn_count, so cadence
+    checks (contextCadence, dialecticCadence) are always satisfied — every turn
+    fires both context refresh and dialectic, ignoring the configured cadence.
+    """
+
+    def test_on_turn_start_called_before_prefetch(self):
+        """Source-level check: on_turn_start appears before prefetch in the prologue."""
+        import inspect
+        from agent.turn_context import build_turn_context as _btc
+        src = inspect.getsource(_btc)
+        idx_turn_start = src.index(".on_turn_start(")
+        idx_prefetch = src.index(".prefetch_bundle(")
+        assert idx_turn_start < idx_prefetch, (
+            "on_turn_start() must be called before prefetch_bundle() in the turn prologue "
+            "so that memory providers have the correct turn count for cadence checks"
+        )
+
+    def test_on_turn_start_uses_user_turn_count(self):
+        """Source-level check: on_turn_start receives the user_turn_count."""
+        import inspect
+        from agent.turn_context import build_turn_context as _btc
+        src = inspect.getsource(_btc)
+        assert "on_turn_start(agent._user_turn_count" in src

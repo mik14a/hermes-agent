@@ -1465,6 +1465,8 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _ext_system_prepend = _ctx.ext_system_prepend
+    _ext_system_append = _ctx.ext_system_append
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1823,8 +1825,8 @@ def run_conversation(
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
-        # External recall context is injected into the user message, not the system
-        # prompt, so the stable cache prefix remains unchanged.
+        # External recall may inject into the user message or the system prompt
+        # depending on provider recall_injection_position.
         #
         # NOTE: Plugin context from pre_llm_call hooks is injected into the
         # user message (see injection block above), NOT the system prompt.
@@ -1837,6 +1839,10 @@ def run_conversation(
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
         effective_system = active_system_prompt or ""
+        if _ext_system_prepend:
+            effective_system = (_ext_system_prepend + "\n\n" + effective_system).strip()
+        if _ext_system_append:
+            effective_system = (effective_system + "\n\n" + _ext_system_append).strip()
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         if effective_system:

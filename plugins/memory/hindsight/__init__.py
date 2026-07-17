@@ -127,6 +127,117 @@ def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
     os.environ.setdefault(_PORT_HEALTH_GRACE_ENV, repr(seconds))
 
 
+def _config_get(config: dict, *keys: str, default: Any = None) -> Any:
+    """Return the first present config value across snake_case / camelCase keys."""
+    if not isinstance(config, dict):
+        return default
+    for key in keys:
+        if key in config and config[key] is not None:
+            return config[key]
+    return default
+
+
+_VALID_RECALL_TYPES = {"world", "experience", "observation"}
+_VALID_RECALL_INJECTION_POSITIONS = {"prepend", "append", "user"}
+_DEFAULT_RECALL_PROMPT_PREAMBLE = (
+    "# Hindsight Memory (persistent cross-session context)\n"
+    "Use this to answer questions about the user and prior sessions. "
+    "Do not call tools to look up information that is already present here."
+)
+
+
+def _normalize_recall_types(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [part.strip() for part in value.split(",") if part.strip()]
+    if not isinstance(value, list):
+        return None
+    normalized = [str(item).strip() for item in value if str(item).strip()]
+    filtered = [item for item in normalized if item in _VALID_RECALL_TYPES]
+    return filtered or None
+
+
+def _slice_last_turns_by_user_boundary(messages: list[dict[str, Any]], turns: int) -> list[dict[str, Any]]:
+    if not messages or turns <= 0:
+        return []
+    user_turns_seen = 0
+    start_index = -1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            user_turns_seen += 1
+            if user_turns_seen >= turns:
+                start_index = index
+                break
+    if start_index == -1:
+        return list(messages)
+    return messages[start_index:]
+
+
+def _compose_recall_query(
+    latest_query: str,
+    messages: list[dict[str, Any]] | None,
+    recall_context_turns: int,
+    recall_roles: list[str] | None = None,
+) -> str:
+    latest = latest_query.strip()
+    if recall_context_turns <= 1 or not messages:
+        return latest
+
+    allowed_roles = set(recall_roles or ("user", "assistant"))
+    contextual_messages = _slice_last_turns_by_user_boundary(messages, recall_context_turns)
+    context_lines: list[str] = []
+    for message in contextual_messages:
+        role = message.get("role")
+        if role not in allowed_roles:
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user" and content == latest:
+            continue
+        context_lines.append(f"{role}: {content}")
+
+    if not context_lines:
+        return latest
+    return "Prior context:\n" + "\n".join(context_lines) + "\n\n" + latest
+
+
+def _truncate_recall_query(query: str, latest_query: str, max_chars: int) -> str:
+    latest = latest_query.strip()
+    if max_chars <= 0:
+        return query
+    if len(query) <= max_chars:
+        return query
+
+    latest_only = latest[:max_chars] if len(latest) > max_chars else latest
+    marker = "Prior context:\n"
+    marker_index = query.find(marker)
+    if marker_index == -1:
+        return latest_only
+
+    suffix = query[marker_index + len(marker):]
+    latest_marker = suffix.rfind("\n\n" + latest)
+    if latest_marker == -1:
+        return latest_only
+
+    context_block = suffix[:latest_marker]
+    context_lines = [line for line in context_block.splitlines() if line.strip()]
+    while context_lines and len("Prior context:\n" + "\n".join(context_lines) + "\n\n" + latest) > max_chars:
+        context_lines.pop(0)
+
+    if not context_lines:
+        return latest_only
+    return "Prior context:\n" + "\n".join(context_lines) + "\n\n" + latest
+
+
+def _format_prefetch_block(raw_result: str, preamble: str = "") -> str:
+    if not raw_result or not raw_result.strip():
+        return ""
+    header = preamble or _DEFAULT_RECALL_PROMPT_PREAMBLE
+    return f"{header}\n\n{raw_result}"
+
+
 def _check_local_runtime() -> tuple[bool, str | None]:
     """Return whether local embedded Hindsight imports cleanly.
 
@@ -826,6 +937,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+        self._recall_injection_position = "user"
+        self._recall_context_turns = 1
+        self._recall_roles = ["user", "assistant"]
+        self._recall_message_buffer: list[dict[str, str]] = []
 
         # Bank
         self._bank_mission = ""
@@ -1125,6 +1240,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "recall_context_turns", "description": "Number of prior user turns to include in recall query context", "default": 1},
+            {"key": "recall_injection_position", "description": "Where to inject recalled memories", "default": "user", "choices": ["prepend", "append", "user"]},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -1619,17 +1736,42 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
         # Default narrows recall to observation-only; pass an explicit
         # `recall_types` list in config.json to broaden (e.g. include
-        # "world" / "experience") or to disable the filter entirely.
-        configured_types = self._config.get("recall_types")
+        # "world" / "experience").
+        configured_types = _config_get(self._config, "recall_types", "recallTypes")
         if configured_types is None:
             self._recall_types = ["observation"]
-        elif isinstance(configured_types, str):
-            # Allow comma-separated strings for parity with recall_tags.
-            self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
-            self._recall_types = list(configured_types) or ["observation"]
+            normalized = _normalize_recall_types(configured_types)
+            self._recall_types = normalized if normalized else ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
-        self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        self._recall_max_input_chars = int(
+            _config_get(self._config, "recall_max_input_chars", "recallMaxQueryChars", default=800)
+        )
+        injection_position = _config_get(
+            self._config, "recall_injection_position", "recallInjectionPosition", default="user"
+        )
+        self._recall_injection_position = (
+            injection_position
+            if injection_position in _VALID_RECALL_INJECTION_POSITIONS
+            else "user"
+        )
+        self._recall_context_turns = max(
+            1,
+            _parse_int_setting(
+                _config_get(self._config, "recall_context_turns", "recallContextTurns", default=1),
+                1,
+            ),
+        )
+        recall_roles = _config_get(self._config, "recall_roles", "recallRoles")
+        if isinstance(recall_roles, list) and recall_roles:
+            self._recall_roles = [
+                str(role).strip()
+                for role in recall_roles
+                if str(role).strip() in {"user", "assistant", "system", "tool"}
+            ] or ["user", "assistant"]
+        else:
+            self._recall_roles = ["user", "assistant"]
+        self._recall_message_buffer = []
         self._retain_async = self._config.get("retain_async", True)
         self._prefetch_waits_for_retain = self._config.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(
@@ -1649,9 +1791,12 @@ class HindsightMemoryProvider(MemoryProvider):
                          self._bank_id_template, self._agent_identity, self._agent_workspace,
                          self._platform, self._user_id, self._bank_id)
         logger.debug("Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
-                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s",
+                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, "
+                     "recall_types=%s, recall_context_turns=%d, recall_injection_position=%s, "
+                     "tags=%s, recall_tags=%s",
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
+                     self._recall_types, self._recall_context_turns, self._recall_injection_position,
                      self._tags, self._recall_tags)
 
         # For local mode, start the embedded daemon in the background so it
@@ -1746,96 +1891,125 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            logger.debug("Prefetch: waiting for background thread to complete")
-            self._prefetch_thread.join(timeout=3.0)
-        with self._prefetch_lock:
-            result = self._prefetch_result
-            self._prefetch_result = ""
-        if not result:
-            logger.debug("Prefetch: no results available")
+    def prefetch_injection_position(self) -> str:
+        return self._recall_injection_position
+
+    def _build_recall_query(self, query: str) -> str:
+        latest = (query or "").strip()
+        if not latest:
             return ""
-        logger.debug("Prefetch: returning %d chars of context", len(result))
-        header = self._recall_prompt_preamble or (
-            "# Hindsight Memory (persistent cross-session context)\n"
-            "Use this to answer questions about the user and prior sessions. "
-            "Do not call tools to look up information that is already present here."
+        composed = _compose_recall_query(
+            latest,
+            self._recall_message_buffer,
+            self._recall_context_turns,
+            self._recall_roles,
         )
-        return f"{header}\n\n{result}"
+        return _truncate_recall_query(composed, latest, self._recall_max_input_chars)
+
+    def _fetch_recall_text(self, query: str) -> str:
+        """Run recall (or reflect) synchronously for the current turn's query."""
+        if self._memory_mode == "tools":
+            logger.debug("Recall: skipped (tools-only mode)")
+            return ""
+        if not self._auto_recall:
+            logger.debug("Recall: skipped (auto_recall disabled)")
+            return ""
+        if self._shutting_down.is_set():
+            logger.debug("Recall: skipped (shutting down)")
+            return ""
+
+        recall_query = self._build_recall_query(query)
+        if not recall_query:
+            logger.debug("Recall: skipped (empty recall query)")
+            return ""
+
+        try:
+            if self._prefetch_method == "reflect":
+                logger.debug(
+                    "Recall: calling reflect (bank=%s, query_len=%d)",
+                    self._bank_id, len(recall_query),
+                )
+                resp = self._run_hindsight_operation(
+                    lambda client: client.areflect(
+                        bank_id=self._bank_id, query=recall_query, budget=self._budget
+                    )
+                )
+                return (resp.text or "").strip()
+            recall_kwargs: dict = {
+                "bank_id": self._bank_id,
+                "query": recall_query,
+                "budget": self._budget,
+                "max_tokens": self._recall_max_tokens,
+            }
+            if self._recall_tags:
+                recall_kwargs["tags"] = self._recall_tags
+                recall_kwargs["tags_match"] = self._recall_tags_match
+            if self._recall_types:
+                recall_kwargs["types"] = self._recall_types
+            logger.debug(
+                "Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
+                self._bank_id, len(recall_query), self._budget,
+            )
+            resp = self._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs)
+            )
+            num_results = len(resp.results) if resp.results else 0
+            logger.debug("Recall: recall returned %d results", num_results)
+            if not resp.results:
+                return ""
+            return "\n".join(f"- {r.text}" for r in resp.results if r.text)
+        except Exception as e:
+            logger.debug("Hindsight recall failed: %s", e, exc_info=True)
+            return ""
+
+    def consume_prefetch(self, query: str, *, session_id: str = "") -> tuple[str, str]:
+        result = self._fetch_recall_text(query)
+        if not result:
+            logger.debug("Recall: no results available")
+            return self._recall_injection_position, ""
+        logger.debug("Recall: returning %d chars of context", len(result))
+        return self._recall_injection_position, _format_prefetch_block(
+            result, self._recall_prompt_preamble
+        )
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        position, block = self.consume_prefetch(query, session_id=session_id)
+        return block if position == "user" else ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        if self._memory_mode == "tools":
-            logger.debug("Prefetch: skipped (tools-only mode)")
-            return
-        if not self._auto_recall:
-            logger.debug("Prefetch: skipped (auto_recall disabled)")
-            return
-        if self._shutting_down.is_set():
-            logger.debug("Prefetch: skipped (shutting down)")
-            return
-        # Truncate query to max chars
-        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
-            query = query[:self._recall_max_input_chars]
+        """No-op: recall runs synchronously at turn start via consume_prefetch()."""
+        logger.debug("Prefetch: skipped (sync recall at turn start)")
 
-        def _run():
-            # Ensure the just-completed turn's retain is recall-visible on the
-            # server before we recall, so the warmed context for the next turn
-            # includes it. This waits for the local writer queue to drain AND
-            # for the server-side async retain op(s) to complete (an explicit
-            # read-after-write signal), because async retain returns on
-            # acceptance rather than durability. Runs on the background prefetch
-            # thread, never the reply path, so it adds no response latency.
-            if self._prefetch_waits_for_retain:
-                self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-            try:
-                if self._prefetch_method == "reflect":
-                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-                    text = resp.text or ""
-                else:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
-                    logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
-                                 self._bank_id, len(query), self._budget)
-                    resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                    num_results = len(resp.results) if resp.results else 0
-                    logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
-                if text:
-                    with self._prefetch_lock:
-                        self._prefetch_result = text
-            except Exception as e:
-                logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
-
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
-        self._prefetch_thread.start()
-
-    def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
-        now = datetime.now(timezone.utc).isoformat()
+    def _build_turn_messages(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        timestamp: str | None = None,
+    ) -> List[Dict[str, str]]:
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
         return [
             {
                 "role": "user",
                 "content": f"{self._retain_user_prefix}: {user_content}",
-                "timestamp": now,
+                "timestamp": ts,
             },
             {
                 "role": "assistant",
                 "content": f"{self._retain_assistant_prefix}: {assistant_content}",
-                "timestamp": now,
+                "timestamp": ts,
             },
         ]
 
-    def _build_metadata(self, *, message_count: int, turn_index: int) -> Dict[str, str]:
+    def _build_metadata(
+        self,
+        *,
+        message_count: int,
+        turn_index: int,
+        retained_at: str | None = None,
+    ) -> Dict[str, str]:
         metadata: Dict[str, str] = {
-            "retained_at": _utc_timestamp(),
+            "retained_at": retained_at or _utc_timestamp(),
             "message_count": str(message_count),
             "turn_index": str(turn_index),
         }
@@ -1870,12 +2044,15 @@ class HindsightMemoryProvider(MemoryProvider):
         metadata: Dict[str, str] | None = None,
         tags: List[str] | None = None,
         retain_async: bool | None = None,
+        timestamp: str | None = None,
     ) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {
             "bank_id": self._bank_id,
             "content": content,
             "metadata": metadata or self._build_metadata(message_count=1, turn_index=self._turn_index),
         }
+        if timestamp:
+            kwargs["timestamp"] = timestamp
         if context is not None:
             kwargs["context"] = context
         if document_id:
@@ -1909,6 +2086,11 @@ class HindsightMemoryProvider(MemoryProvider):
 
         if session_id:
             self._session_id = str(session_id).strip()
+
+        if user_content:
+            self._recall_message_buffer.append({"role": "user", "content": user_content})
+        if assistant_content:
+            self._recall_message_buffer.append({"role": "assistant", "content": assistant_content})
 
         turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
         self._session_turns.append(turn)
@@ -2194,6 +2376,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._turn_counter = 0
         self._turn_index = 0
         self._last_retained_turn_count = 0
+        self._recall_message_buffer = []
         logger.debug(
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
             self._session_id, self._parent_session_id, reset, self._document_id,
