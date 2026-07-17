@@ -86,15 +86,16 @@ const SEND_READ_RECEIPTS =
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
+const HERMES_HOME = path.join(process.env.HOME || '~', '.hermes');
 // Cache directories: the Python gateway passes the profile-aware paths via
-// env (HERMES_HOME-aware, new cache/ layout).  Fall back to the legacy
-// hardcoded locations for bridges launched outside the gateway.
+// env (HERMES_HOME-aware, new cache/ layout).  Fall back to the consolidated
+// cache/* layout for bridges launched outside the gateway.
 const IMAGE_CACHE_DIR = process.env.HERMES_IMAGE_CACHE_DIR
-  || path.join(process.env.HOME || '~', '.hermes', 'image_cache');
+  || path.join(HERMES_HOME, 'cache', 'images');
 const DOCUMENT_CACHE_DIR = process.env.HERMES_DOCUMENT_CACHE_DIR
-  || path.join(process.env.HOME || '~', '.hermes', 'document_cache');
+  || path.join(HERMES_HOME, 'cache', 'documents');
 const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
-  || path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
+  || path.join(HERMES_HOME, 'cache', 'audio');
 
 // Self-hash of this script file.  Reported in /health so the Python gateway
 // can detect a running bridge that predates the current bridge.js and

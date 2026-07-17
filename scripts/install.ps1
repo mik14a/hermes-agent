@@ -2767,15 +2767,14 @@ function Copy-ConfigTemplates {
     Write-Info "Setting up configuration files..."
     
     # Create the HERMES_HOME directory structure ($HermesHome, default %LOCALAPPDATA%\hermes)
-    New-Item -ItemType Directory -Force -Path "$HermesHome\cron" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\sessions" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\logs" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\pairing" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\hooks" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\image_cache" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\audio_cache" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\memories" | Out-Null
-    New-Item -ItemType Directory -Force -Path "$HermesHome\skills" | Out-Null
+    # Create HERMES_HOME directory structure (consolidated cache/* layout #3610).
+    # Do not mkdir legacy image_cache/ etc. — empty legacy dirs break MEDIA delivery.
+    foreach ($dir in @("cron", "sessions", "logs", "logs\curator", "pairing", "hooks", "memories", "skills")) {
+        New-Item -ItemType Directory -Force -Path "$HermesHome\$dir" | Out-Null
+    }
+    foreach ($dir in @("cache\images", "cache\audio", "cache\videos", "cache\documents", "cache\screenshots")) {
+        New-Item -ItemType Directory -Force -Path "$HermesHome\$dir" | Out-Null
+    }
 
     
     # Create .env

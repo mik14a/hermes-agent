@@ -1920,8 +1920,11 @@ EOF
 copy_config_templates() {
     log_info "Setting up configuration files..."
 
-    # Create ~/.hermes directory structure (config at top level, code in subdir)
-    mkdir -p "$HERMES_HOME"/{cron,sessions,logs,pairing,hooks,image_cache,audio_cache,memories,skills}
+    # Create ~/.hermes directory structure (config at top level, code in subdir).
+    # Use consolidated cache/* layout (#3610). Do not mkdir legacy image_cache/
+    # etc. — empty legacy dirs make get_hermes_dir() prefer the old path forever.
+    mkdir -p "$HERMES_HOME"/{cron,sessions,logs,logs/curator,pairing,hooks,memories,skills}
+    mkdir -p "$HERMES_HOME"/cache/{images,audio,videos,documents,screenshots}
 
     # Create .env at ~/.hermes/.env (top level, easy to find)
     if [ ! -f "$HERMES_HOME/.env" ]; then
