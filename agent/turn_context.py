@@ -462,6 +462,8 @@ class TurnContext:
     should_review_memory: bool = False  # post-turn memory review should fire
     plugin_user_context: str = ""  # ``pre_llm_call`` context (appended to user message)
     ext_prefetch_cache: str = ""  # external-memory prefetch, reused across iterations
+    ext_system_prepend: str = ""  # recall injected before the cached system prompt (this turn)
+    ext_system_append: str = ""  # recall injected after the cached system prompt (this turn)
     preflight_compression_blocked: bool = False  # immediate retry proved ineffective
 
 
@@ -852,12 +854,12 @@ def _memory_query_text(original_user_message: Any) -> str:
 
 def _memory_turn_start_and_prefetch(
     agent: Any, original_user_message: Any, turn_author: Optional[Dict[str, Any]] = None,
-) -> str:
+) -> Tuple[str, str, str]:
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
-    Returns the prefetch text (``""`` when nothing was injected)."""
+    Returns ``(user, system_prepend, system_append)`` injection text."""
     if not agent._memory_manager:
-        return ""
+        return "", "", ""
     _query = _memory_query_text(original_user_message)
     # The author rides along so a provider can attribute THIS turn, not whoever opened the session.
     _author = turn_author if isinstance(turn_author, dict) else {}
@@ -867,18 +869,29 @@ def _memory_turn_start_and_prefetch(
             author_id=_author.get("id") or None, author_name=_author.get("name") or None,
             author_is_bot=bool(_author.get("is_bot")),
         )
-    ext_prefetch_cache = ""
+    ext_prefetch_cache = ext_system_prepend = ext_system_append = ""
     with suppress(Exception):
         if not is_trivial_prompt(_query):
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+            bundle = None
+            prefetch_bundle = getattr(agent._memory_manager, "prefetch_bundle", None)
+            if callable(prefetch_bundle):
+                raw = prefetch_bundle(_query, session_id=agent.session_id)
+                if isinstance(raw, dict):
+                    bundle = raw
+            if bundle is None:
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+            else:
+                ext_prefetch_cache = bundle.get("user", "") or ""
+                ext_system_prepend = bundle.get("system_prepend", "") or ""
+                ext_system_append = bundle.get("system_append", "") or ""
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
-    if ext_prefetch_cache:
+    if ext_prefetch_cache or ext_system_prepend or ext_system_append:
         with suppress(Exception):
             _recall_indicator = agent._memory_manager.describe_recall()
             if _recall_indicator:
                 agent._emit_status(_recall_indicator)
-    return ext_prefetch_cache
+    return ext_prefetch_cache, ext_system_prepend, ext_system_append
 
 
 def _stamp_api_content_sidecar(
@@ -1129,7 +1142,9 @@ def build_turn_context(
     )
 
     _bind_interrupt_scope(agent, ra)
-    ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
+    ext_prefetch_cache, ext_system_prepend, ext_system_append = _memory_turn_start_and_prefetch(
+        agent, original_user_message, turn_author
+    )
 
     # Title the session now: titling depends only on the user's ask (before any injected
     # context lands on list content), so it runs concurrently with the turn. Daemon thread,
@@ -1157,6 +1172,7 @@ def build_turn_context(
         effective_task_id=effective_task_id, turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx, should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context, ext_prefetch_cache=ext_prefetch_cache,
+        ext_system_prepend=ext_system_prepend, ext_system_append=ext_system_append,
         preflight_compression_blocked=compaction.blocked,
     )
 
@@ -1183,6 +1199,7 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
 def build_api_messages(
     agent: Any, messages: List[Dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
+    ext_system_prepend: Any = "", ext_system_append: Any = "",
 ) -> Tuple[List[Dict[str, Any]], str]:
     """Build the wire copy of ``messages`` for one API call plus the effective system
     message. Returns ``(api_messages, effective_system)``.
@@ -1276,11 +1293,15 @@ def build_api_messages(
         api_messages.append(api_msg)
 
     # Final system message = cached prompt + ephemeral additions (API-time only).
-    # Plugin/recall context goes into the user message, never the system prompt: the
-    # prompt is built ONCE per session and replayed verbatim (stable cache prefix).
+    # User-targeted recall stays on the user message (stable cache prefix). prepend /
+    # append recall is applied here for this call only and is not persisted.
     effective_system = active_system_prompt or ""
+    if ext_system_prepend:
+        effective_system = (str(ext_system_prepend) + "\n\n" + effective_system).strip()
     if agent.ephemeral_system_prompt:
         effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+    if ext_system_append:
+        effective_system = (effective_system + "\n\n" + str(ext_system_append)).strip()
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
     return api_messages, effective_system

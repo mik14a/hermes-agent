@@ -120,7 +120,7 @@ def prepared(sync):
 def begin(a, turn, query):
     a._user_turn_count = turn
     started = time.monotonic()
-    context = _memory_turn_start_and_prefetch(a, query)
+    context, _, _ = _memory_turn_start_and_prefetch(a, query)
     return {"query": query, "context": context, "elapsed": time.monotonic() - started,
             "api_content": compose_user_api_content(query, context, "")}
 

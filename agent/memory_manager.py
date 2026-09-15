@@ -445,14 +445,47 @@ class MemoryManager:
     _strip_skill_scaffolding = staticmethod(extract_user_instruction_from_skill_message)
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
-        """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+        """Merge non-empty prefetch context destined for the user message."""
+        return self.prefetch_bundle(query, session_id=session_id).get("user", "")
+
+    def prefetch_bundle(self, query: str, *, session_id: str = "") -> Dict[str, str]:
+        """Prefetch once per provider and group the text by injection target.
+
+        ``user`` goes on the current user turn; ``system_prepend`` / ``system_append``
+        are applied to the API system message for this turn only.
+        """
+        empty = {"user": "", "system_prepend": "", "system_append": ""}
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
-            return ""
-        parts = self._each_provider(
-            "prefetch failed (non-fatal)", lambda p: self._prefetch_provider(p, clean_query, session_id=session_id),
-        )
-        return "\n\n".join(p for p in parts if p and p.strip())
+            return dict(empty)
+        user_parts: List[str] = []
+        prepend_parts: List[str] = []
+        append_parts: List[str] = []
+
+        def _collect(provider: MemoryProvider) -> None:
+            text = self._prefetch_provider(provider, clean_query, session_id=session_id)
+            if not text or not str(text).strip():
+                return
+            position = "user"
+            getter = getattr(provider, "prefetch_injection_position", None)
+            if callable(getter):
+                try:
+                    position = getter() or "user"
+                except Exception:
+                    position = "user"
+            if position == "prepend":
+                prepend_parts.append(text)
+            elif position == "append":
+                append_parts.append(text)
+            else:
+                user_parts.append(text)
+
+        self._each_provider("prefetch failed (non-fatal)", _collect)
+        return {
+            "user": "\n\n".join(user_parts),
+            "system_prepend": "\n\n".join(prepend_parts),
+            "system_append": "\n\n".join(append_parts),
+        }
 
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
         """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external

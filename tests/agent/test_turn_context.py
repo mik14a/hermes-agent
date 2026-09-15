@@ -263,6 +263,20 @@ def test_prefetch_runs_for_substantive_user_message():
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
+def test_prefetch_bundle_system_append_skips_user_sidecar():
+    agent, mm = _agent_with_memory_manager()
+    mm.prefetch_bundle.return_value = {
+        "user": "",
+        "system_prepend": "",
+        "system_append": "APPENDED MEMORY",
+    }
+    ctx = _build(agent, user_message="what did we decide about the deploy pipeline?")
+    mm.prefetch_all.assert_not_called()
+    assert ctx.ext_prefetch_cache == ""
+    assert ctx.ext_system_append == "APPENDED MEMORY"
+    assert ctx.ext_system_prepend == ""
+
+
 # ── Per-turn author ──────────────────────────────────────────────────────────
 
 

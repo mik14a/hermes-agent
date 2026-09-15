@@ -231,6 +231,20 @@ class TestMemoryManager:
         assert p2.queued_prefetches == ["next turn"]
 
 
+    def test_prefetch_bundle_routes_append_away_from_user(self):
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider("external")
+        provider._prefetch_result = "remembered"
+        provider.prefetch_injection_position = lambda: "append"
+        mgr.add_provider(provider)
+
+        bundle = mgr.prefetch_bundle("what do you remember?", session_id="s")
+        assert bundle["user"] == ""
+        assert bundle["system_prepend"] == ""
+        assert bundle["system_append"] == "remembered"
+        assert mgr.prefetch_all("what do you remember?", session_id="s") == ""
+
+
     def test_sync_failure_doesnt_block_others(self):
         """If one provider's sync fails, others still run."""
         mgr = MemoryManager()
